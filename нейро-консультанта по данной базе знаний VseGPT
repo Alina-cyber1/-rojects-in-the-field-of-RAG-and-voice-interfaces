@@ -1,0 +1,153 @@
+# -*- coding: utf-8 -*-
+"""Нейро-консультант по регламенту экологической экспертизы (VseGPT)"""
+!pip install openai==1.55.3 langchain==0.3.11 langchain-openai==0.2.10 langchain-community==0.3.8 faiss-cpu==1.9.0.post1 tiktoken
+
+import re
+import requests
+import getpass
+import os
+import textwrap
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from openai import OpenAI
+
+# ====================== НАСТРОЙКИ VSEGPT ======================
+# Приоритет: переменная окружения VSEGPT_API_KEY, иначе запрос у пользователя
+VSEGPT_API_KEY = os.environ.get("VSEGPT_API_KEY")
+if not VSEGPT_API_KEY:
+    VSEGPT_API_KEY = getpass.getpass("Введите ваш API ключ от VseGPT.ru: ")
+
+VSEGPT_BASE_URL = "https://api.vsegpt.ru/v1"
+
+os.environ["VSEGPT_API_KEY"] = VSEGPT_API_KEY  # на всякий случай
+
+client = OpenAI(
+    api_key=VSEGPT_API_KEY,
+    base_url=VSEGPT_BASE_URL
+)
+
+# ====================== ЗАГРУЗКА ДОКУМЕНТА ======================
+def load_document_text(url: str) -> str:
+    match_ = re.search('/document/d/([a-zA-Z0-9-_]+)', url)
+    if match_ is None:
+        raise ValueError('Некорректная ссылка на Google Docs')
+    doc_id = match_.group(1)
+    response = requests.get(f'https://docs.google.com/document/d/{doc_id}/export?format=txt')
+    response.raise_for_status()
+    return response.text
+
+DOC_URL = "https://docs.google.com/document/d/1WMp-uMA4_59Ybp2ynCvrFIPV1OwGHQA4zvW526BawJM"
+print("Загрузка документа...")
+full_text = load_document_text(DOC_URL)
+print(f"Документ загружен, длина текста: {len(full_text)} символов")
+
+# ====================== РАЗБИЕНИЕ НА ЧАНКИ ======================
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", " ", ""]
+)
+chunks = text_splitter.split_text(full_text)
+print(f"Создано {len(chunks)} чанков")
+
+docs = [Document(page_content=chunk, metadata={"source": "reggos"}) for chunk in chunks]
+
+# ====================== ЭМБЕДДИНГИ И ИНДЕКС ======================
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=VSEGPT_API_KEY,
+    openai_api_base=VSEGPT_BASE_URL,
+)
+
+print("Создание эмбеддингов и индекса FAISS...")
+vectorstore = FAISS.from_documents(docs, embeddings)
+print("Индекс готов.")
+
+# Сохраняем индекс для будущих запусков (чтобы не пересоздавать)
+vectorstore.save_local("eco_expertise_index")
+print("Индекс сохранён в папку 'eco_expertise_index'")
+
+# ====================== ПРОМПТ ======================
+system_prompt = """
+Ты — нейро-консультант по Административному регламенту проведения государственной экологической экспертизы федерального уровня.
+Твоя задача — отвечать на вопросы пользователей **строго на основе текста этого регламента**.
+
+Правила:
+1. Используй только информацию из предоставленного документа. Не придумывай факты, не ссылайся на другие законы.
+2. Если ответ содержится в документе — дай чёткий ответ с указанием раздела (если возможно).
+3. Если в документе нет ответа на вопрос — прямо скажи об этом: «В регламенте такая информация отсутствует».
+4. Если вопрос не касается регламента — вежливо сообщи: «Этот вопрос выходит за рамки моей компетенции. Я могу помочь только с информацией о порядке проведения государственной экологической экспертизы согласно данному регламенту».
+5. Отвечай кратко и по существу.
+"""
+
+# ====================== УЛУЧШЕННАЯ ФУНКЦИЯ ОТВЕТА ======================
+def answer_question(question: str, k_start: int = 8, k_max: int = 12) -> str:
+    """
+    Поиск ответа с динамическим увеличением количества чанков,
+    если первые k_start не дали результата.
+    """
+    for current_k in range(k_start, k_max + 1, 2):
+        docs = vectorstore.similarity_search(question, k=current_k)
+        context = "\n\n".join([doc.page_content for doc in docs])
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Вопрос: {question}\n\nКонтекст из документа:\n{context}"}
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.1,
+            max_tokens=600
+        )
+
+        answer = response.choices[0].message.content
+
+        # Если ответ не содержит фразу "информация отсутствует", считаем его удачным
+        if "информация отсутствует" not in answer.lower():
+            return textwrap.fill(answer, width=80)
+
+        # Если это последняя итерация, возвращаем последний ответ
+        if current_k == k_max:
+            return textwrap.fill(answer, width=80)
+
+    return "Не удалось получить ответ."
+
+# ====================== ТЕСТИРОВАНИЕ ======================
+test_questions = [
+    "Каков срок проведения государственной экологической экспертизы?",
+    "Какие документы нужны для подачи заявления?",
+    "Сколько стоит проведение экспертизы?",
+    "Кто может быть заявителем?",
+    "Какой штраф за загрязнение воздуха?"  # не по теме
+]
+
+print("\n" + "="*60)
+print("ТЕСТИРОВАНИЕ НЕЙРО-КОНСУЛЬТАНТА")
+print("="*60)
+
+for q in test_questions:
+    print(f"\nВопрос: {q}")
+    print("Ответ:")
+    try:
+        ans = answer_question(q)
+        print(ans)
+    except Exception as e:
+        print(f"Ошибка: {e}")
+    print("-"*40)
+
+# ====================== ИНТЕРАКТИВНЫЙ РЕЖИМ ======================
+def interactive_chat():
+    print("\n--- Интерактивный режим. Введите 'стоп' для выхода. ---")
+    while True:
+        user_q = input("\nВаш вопрос: ")
+        if user_q.lower() in ["стоп", "exit", "quit"]:
+            break
+        ans = answer_question(user_q)
+        print("Консультант:", ans)
+
+# Раскомментируйте следующую строку для запуска диалога
+# interactive_chat()
