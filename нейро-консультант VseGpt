@@ -1,0 +1,189 @@
+# ваше решение
+# -*- coding: utf-8 -*-
+
+!pip install openai==1.55.3 langchain==0.3.11 langchain-openai==0.2.10 langchain-community==0.3.8 faiss-cpu==1.9.0.post1 tiktoken
+import re
+import requests
+import getpass
+import os
+import textwrap
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from openai import OpenAI
+
+# ====================== НАСТРОЙКИ VSEGPT ======================
+VSEGPT_API_KEY = os.environ.get("VSEGPT_API_KEY")
+if not VSEGPT_API_KEY:
+    VSEGPT_API_KEY = getpass.getpass("Введите ваш API ключ от VseGPT.ru: ")
+
+VSEGPT_BASE_URL = "https://api.vsegpt.ru/v1"
+os.environ["VSEGPT_API_KEY"] = VSEGPT_API_KEY
+
+client = OpenAI(
+    api_key=VSEGPT_API_KEY,
+    base_url=VSEGPT_BASE_URL
+)
+
+# ====================== ЗАГРУЗКА ДОКУМЕНТА ======================
+def load_document_text(url: str) -> str:
+    """Скачивает текст Google Docs документа по ссылке."""
+    match_ = re.search('/document/d/([a-zA-Z0-9-_]+)', url)
+    if match_ is None:
+        raise ValueError('Некорректная ссылка на Google Docs')
+    doc_id = match_.group(1)
+    response = requests.get(f'https://docs.google.com/document/d/{doc_id}/export?format=txt')
+    response.raise_for_status()
+    return response.text
+
+DOC_URL = "https://docs.google.com/document/d/1YhUEX9fZDNTeE3eJ-yXskxZG46LsTRYvXjZ9Ij-t3Gw/edit?usp=sharing"
+print("Загрузка документа...")
+full_text = load_document_text(DOC_URL)
+print(f"Документ загружен, длина текста: {len(full_text)} символов")
+
+# ====================== РАЗБИЕНИЕ НА ЧАНКИ ======================
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1500,          # оптимальный размер для технических документов
+    chunk_overlap=150,
+    separators=["\n\n", "\n", " ", ""]
+)
+chunks = text_splitter.split_text(full_text)
+print(f"Создано {len(chunks)} чанков")
+
+docs = [Document(page_content=chunk, metadata={"source": "tr_railway"}) for chunk in chunks]
+
+# ====================== ЭМБЕДДИНГИ И ИНДЕКС ======================
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=VSEGPT_API_KEY,
+    openai_api_base=VSEGPT_BASE_URL,
+)
+
+print("Создание эмбеддингов и индекса FAISS...")
+vectorstore = FAISS.from_documents(docs, embeddings)
+print("Индекс готов.")
+
+# Сохраняем индекс для будущих запусков
+vectorstore.save_local("tr_railway_index")
+print("Индекс сохранён в папку 'tr_railway_index'")
+
+# ====================== ПРОМПТ ======================
+system_prompt = """
+Ты — нейро-консультант по Техническому регламенту Таможенного союза "О безопасности железнодорожного подвижного состава" (ТР ТС 001/2011).
+Твоя задача — отвечать на вопросы пользователей **строго на основе текста этого документа**.
+
+Правила:
+1. Используй только информацию из предоставленного контекста документа. Не придумывай факты, не ссылайся на другие законы.
+2. Если ответ содержится в контексте — дай чёткий ответ, при возможности указывая раздел или статью.
+3. Если в контексте нет ответа на вопрос — прямо скажи об этом: «В предоставленном фрагменте документа такая информация отсутствует».
+4. Если вопрос не касается тематики регламента — вежливо сообщи: «Этот вопрос выходит за рамки моей компетенции. Я могу помочь только с информацией о техническом регламенте безопасности железнодорожного подвижного состава».
+5. Отвечай кратко, по существу, технически точно.
+"""
+
+# ====================== ПОИСК С ПОРОГОМ РЕЛЕВАНТНОСТИ ======================
+# Порог релевантности (чем меньше число, тем лучше совпадение)
+# similarity_search_with_score возвращает пары (документ, оценка_расстояния)
+# Мы будем конвертировать расстояние в меру сходства: similarity = 1 / (1 + distance)
+RELEVANCE_THRESHOLD = 0.3  # настраиваемый порог (0.3 соответствует расстоянию ~2.33)
+
+def search_with_threshold(query: str, k: int = 8) -> tuple:
+    """
+    Выполняет поиск и возвращает отфильтрованные документы + все результаты со скорами.
+    Возвращает: (filtered_docs, all_results_with_scores)
+    где all_results_with_scores — список кортежей (документ, оценка_расстояния, сходство)
+    """
+    # Получаем все результаты с оценками
+    results_with_scores = vectorstore.similarity_search_with_score(query, k=k)
+
+    # Преобразуем: добавляем меру сходства (чем ближе к 1, тем лучше)
+    all_results = []
+    for doc, score in results_with_scores:
+        similarity = 1 / (1 + score)  # преобразуем расстояние в сходство
+        all_results.append((doc, score, similarity))
+
+    # Фильтруем по порогу сходства
+    filtered_docs = [doc for doc, score, sim in all_results if sim >= RELEVANCE_THRESHOLD]
+
+    return filtered_docs, all_results
+
+# ====================== ФУНКЦИЯ ОТВЕТА С ПОРОГОМ ======================
+def answer_question_with_threshold(question: str) -> str:
+    filtered_docs, all_results = search_with_threshold(question, k=10)
+
+    # Формируем строку со скорами для вывода
+    scores_output = []
+    for i, (doc, distance, sim) in enumerate(all_results):
+        preview = doc.page_content[:50].replace('\n', ' ') + "..."
+        scores_output.append(f"{i+1}. расстояние={distance:.4f}, сходство={sim:.4f} — {preview}")
+
+    scores_text = "\n".join(scores_output)
+
+    # Если после фильтрации не осталось документов — отвечаем заглушкой
+    if not filtered_docs:
+        full_answer = (
+            f"[Все найденные чанки имеют сходство ниже порога ({RELEVANCE_THRESHOLD})]\n\n"
+            f"Я не могу ответить на этот вопрос, так как в документе не найдено достаточно релевантной информации. "
+            f"Пожалуйста, задайте вопрос по техническому регламенту о безопасности железнодорожного подвижного состава.\n\n"
+            f"--- Скоры всех найденных чанков (k=10) ---\n{scores_text}"
+        )
+        return textwrap.fill(full_answer, width=90)
+
+    # Если документы есть — формируем контекст и ответ
+    context = "\n\n".join([doc.page_content for doc in filtered_docs])
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Вопрос: {question}\n\nКонтекст из документа (только релевантные фрагменты):\n{context}"}
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.1,
+        max_tokens=600
+    )
+
+    answer = response.choices[0].message.content
+
+    # Добавляем информацию о скорах в ответ
+    full_answer = f"{answer}\n\n--- Скоры всех найденных чанков (k=10) ---\n{scores_text}"
+    return textwrap.fill(full_answer, width=90)
+
+# ====================== ТЕСТИРОВАНИЕ ======================
+test_questions = [
+    "Какие требования предъявляются к тормозному оборудованию?",
+    "Как часто проводится техническое обслуживание вагонов?",
+    "Кто осуществляет подтверждение соответствия?",
+    "Какая максимальная скорость для грузовых вагонов?",
+    "Какой сегодня курс доллара?",  # не по теме
+    "Что такое безопасность железнодорожного подвижного состава?"  # общий вопрос
+]
+
+print("\n" + "="*70)
+print("ТЕСТИРОВАНИЕ НЕЙРО-КОНСУЛЬТАНТА (ТР ТС, ПОРОГОВЫЙ ПОИСК)")
+print("="*70)
+
+for q in test_questions:
+    print(f"\n❓ Вопрос: {q}")
+    print("="*50)
+    try:
+        ans = answer_question_with_threshold(q)
+        print(ans)
+    except Exception as e:
+        print(f"⚠️ Ошибка: {e}")
+    print("-"*70)
+
+# ====================== ИНТЕРАКТИВНЫЙ РЕЖИМ ======================
+def interactive_chat():
+    print("\n--- Интерактивный режим. Введите 'стоп' для выхода. ---")
+    while True:
+        user_q = input("\nВаш вопрос: ")
+        if user_q.lower() in ["стоп", "exit", "quit"]:
+            break
+        ans = answer_question_with_threshold(user_q)
+        print("Консультант:", ans)
+
+# Раскомментируйте для запуска диалога
+# interactive_chat()
