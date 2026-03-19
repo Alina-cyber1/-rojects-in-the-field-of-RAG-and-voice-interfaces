@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+"""Нейро-консультант по регламенту экологической экспертизы (GigaChat + HuggingFace)."""
+
+import re
+import requests
+import os
+import getpass
+import textwrap
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings  # современный импорт
+from langchain_community.llms import GigaChat
+
+# ====================== БЕЗОПАСНЫЙ ВВОД КЛЮЧА GigaChat ======================
+GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS")
+if not GIGACHAT_CREDENTIALS:
+    GIGACHAT_CREDENTIALS = getpass.getpass("Введите авторизационные данные GigaChat (credentials): ")
+
+gigachat = GigaChat(
+    credentials=GIGACHAT_CREDENTIALS,
+    model="GigaChat",          # можно "GigaChat-Pro"
+    temperature=0.1,
+    max_tokens=1000,
+    verify_ssl_certs=False
+)
+
+# ====================== ЗАГРУЗКА ДОКУМЕНТА ======================
+def load_document_text(url: str) -> str:
+    match_ = re.search('/document/d/([a-zA-Z0-9-_]+)', url)
+    if match_ is None:
+        raise ValueError('Некорректная ссылка на Google Docs')
+    doc_id = match_.group(1)
+    response = requests.get(f'https://docs.google.com/document/d/{doc_id}/export?format=txt')
+    response.raise_for_status()
+    return response.text
+
+DOC_URL = "https://docs.google.com/document/d/1WMp-uMA4_59Ybp2ynCvrFIPV1OwGHQA4zvW526BawJM"
+print("Загрузка документа...")
+full_text = load_document_text(DOC_URL)
+print(f"Документ загружен, длина текста: {len(full_text)} символов")
+
+# ====================== РАЗБИЕНИЕ НА ЧАНКИ ======================
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1500,
+    chunk_overlap=150,
+    separators=["\n\n", "\n", " ", ""]
+)
+chunks = text_splitter.split_text(full_text)
+print(f"Создано {len(chunks)} чанков")
+
+docs = [Document(page_content=chunk, metadata={"source": "eco_expertise"}) for chunk in chunks]
+
+# ====================== ЭМБЕДДИНГИ ЧЕРЕЗ HuggingFace (современный импорт) ======================
+model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+embeddings = HuggingFaceEmbeddings(
+    model_name=model_name,
+    model_kwargs={'device': 'cpu'},
+    encode_kwargs={'normalize_embeddings': True}
+)
+
+print("Создание эмбеддингов и индекса FAISS (это займёт несколько минут)...")
+vectorstore = FAISS.from_documents(docs, embeddings)
+print("Индекс готов.")
+vectorstore.save_local("eco_expertise_index_hf")
+print("Индекс сохранён в папку 'eco_expertise_index_hf'")
+
+# ====================== ПРОМПТ ======================
+system_prompt = """
+Ты — нейро-консультант по Административному регламенту проведения государственной экологической экспертизы федерального уровня.
+Твоя задача — отвечать на вопросы пользователей **строго на основе текста этого регламента**.
+
+Правила:
+1. Используй только информацию из предоставленного контекста документа. Не придумывай факты, не ссылайся на другие законы.
+2. Если ответ содержится в контексте — дай чёткий ответ, при возможности указывая раздел или пункт.
+3. Если в контексте нет ответа на вопрос — прямо скажи об этом: «В предоставленном фрагменте документа такая информация отсутствует».
+4. Если вопрос не касается регламента (например, общие вопросы экологии, другие законы, личные консультации) — вежливо сообщи: «Этот вопрос выходит за рамки моей компетенции. Я могу помочь только с информацией о порядке проведения государственной экологической экспертизы согласно данному регламенту».
+5. Отвечай кратко, по существу, официально-деловым языком.
+"""
+
+# ====================== ФУНКЦИЯ ОТВЕТА ======================
+def answer_question(question: str, k: int = 6) -> str:
+    docs = vectorstore.similarity_search(question, k=k)
+    if not docs:
+        return "Не удалось найти информацию по вашему вопросу в документе."
+    context = "\n\n".join([doc.page_content for doc in docs])
+    prompt = f"""{system_prompt}
+
+Вопрос пользователя: {question}
+
+Контекст из документа:
+{context}
+
+Ответ:"""
+    try:
+        response = gigachat.invoke(prompt)
+        return textwrap.fill(response, width=90)
+    except Exception as e:
+        return f"Ошибка при обращении к GigaChat: {e}"
+
+# ====================== ТЕСТИРОВАНИЕ ======================
+test_questions = [
+    "Каков срок проведения государственной экологической экспертизы?",
+    "Какие документы нужны для подачи заявления?",
+    "Сколько стоит проведение экспертизы?",
+    "Кто может быть заявителем?",
+    "Как обжаловать решение экспертизы?",
+    "Какой штраф за загрязнение воздуха?",
+    "Что такое экологическая экспертиза?"
+]
+
+print("\n" + "="*70)
+print("ТЕСТИРОВАНИЕ НЕЙРО-КОНСУЛЬТАНТА (GigaChat + HuggingFace)")
+print("="*70)
+
+for i, q in enumerate(test_questions, 1):
+    print(f"\n{i}. ❓ Вопрос: {q}")
+    print("-"*50)
+    try:
+        ans = answer_question(q)
+        print(f"Ответ:\n{ans}")
+    except Exception as e:
+        print(f"⚠️ Ошибка: {e}")
+    print("="*70)
+
+# ====================== ИНТЕРАКТИВНЫЙ РЕЖИМ ======================
+def interactive_chat():
+    print("\n--- Интерактивный режим. Введите 'стоп' для выхода. ---")
+    while True:
+        user_q = input("\nВаш вопрос: ")
+        if user_q.lower() in ["стоп", "exit", "quit"]:
+            break
+        ans = answer_question(user_q)
+        print("Консультант:", ans)
+
+# interactive_chat()
